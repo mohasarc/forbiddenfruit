@@ -92,6 +92,17 @@ SSizeArgFunc_p = ctypes.CFUNCTYPE(ctypes.py_object, PyObject_p, Py_ssize_t)
 SSizeObjArgProc_p = ctypes.CFUNCTYPE(ctypes.c_int, PyObject_p, Py_ssize_t, PyObject_p)
 ObjObjProc_p = ctypes.CFUNCTYPE(ctypes.c_int, PyObject_p, PyObject_p)
 
+# Rich comparison constants
+Py_LT = 0
+Py_LE = 1
+Py_EQ = 2
+Py_NE = 3
+Py_GT = 4
+Py_GE = 5
+
+# Rich comparison function type
+RichCompareFunc_p = ctypes.CFUNCTYPE(ctypes.py_object, PyObject_p, PyObject_p, ctypes.c_int)
+
 FILE_p = ctypes.POINTER(PyFile)
 
 
@@ -212,7 +223,7 @@ PyTypeObject._fields_ = [
     ('tp_doc', ctypes.c_void_p),  # Type not declared yet
     ('tp_traverse', ctypes.c_void_p),  # Type not declared yet
     ('tp_clear', ctypes.c_void_p),  # Type not declared yet
-    ('tp_richcompare', ctypes.c_void_p),  # Type not declared yet
+    ('tp_richcompare', RichCompareFunc_p),  # Rich comparison function
     ('tp_weaklistoffset', ctypes.c_void_p),  # Type not declared yet
     ('tp_iter', ctypes.c_void_p),  # Type not declared yet
     ('iternextfunc', ctypes.c_void_p),  # Type not declared yet
@@ -318,11 +329,25 @@ as_async = ("tp_as_async", [
     ("anext", "am_anext"),
 ])
 
+# Rich comparison methods
+as_richcompare = ("tp_richcompare", [
+    ("lt", "tp_richcompare"),
+    ("le", "tp_richcompare"),
+    ("eq", "tp_richcompare"),
+    ("ne", "tp_richcompare"),
+    ("gt", "tp_richcompare"),
+    ("ge", "tp_richcompare"),
+])
+
 override_dict = {}
 for override in [as_number, as_sequence, as_async]:
     tp_as_name = override[0]
     for dunder, impl_method in override[1]:
         override_dict["__{}__".format(dunder)] = (tp_as_name, impl_method)
+
+# Handle rich comparison methods specially
+for dunder, impl_method in as_richcompare[1]:
+    override_dict["__{}__".format(dunder)] = (as_richcompare[0], impl_method)
 
 # divmod isn't a dunder, still make it overridable
 override_dict['divmod()'] = ('tp_as_number', "nb_divmod")
@@ -333,6 +358,9 @@ override_dict['__new__'] = ('tp_new', "tp_new")
 def _is_dunder(func_name):
     return func_name.startswith("__") and func_name.endswith("__")
 
+
+# Global storage for rich comparison methods
+rich_compare_methods = {}
 
 def _curse_special(klass, attr, func):
     """
@@ -353,6 +381,40 @@ def _curse_special(klass, attr, func):
             return NotImplementedRet
 
     tp_as_name, impl_method = override_dict[attr]
+
+    # Special handling for rich comparison methods
+    if tp_as_name == "tp_richcompare":
+        # Store the individual comparison method
+        rich_compare_methods[(klass, attr)] = func
+        
+        # Create a dispatcher function that handles all comparison operations
+        def rich_compare_dispatcher(self, other, op):
+            # Map operation constants to method names
+            op_to_method = {
+                Py_LT: "__lt__",
+                Py_LE: "__le__",
+                Py_EQ: "__eq__",
+                Py_NE: "__ne__",
+                Py_GT: "__gt__",
+                Py_GE: "__ge__"
+            }
+            
+            method_name = op_to_method.get(op)
+            if method_name and (klass, method_name) in rich_compare_methods:
+                try:
+                    return rich_compare_methods[(klass, method_name)](self, other)
+                except NotImplementedError:
+                    return NotImplementedRet
+            else:
+                # Return NotImplemented to allow Python to use default behavior
+                return NotImplemented
+
+        # Set up the rich comparison function
+        tyobj = PyTypeObject.from_address(id(klass))
+        cfunc = RichCompareFunc_p(rich_compare_dispatcher)
+        tp_func_dict[(klass, "tp_richcompare")] = cfunc
+        setattr(tyobj, "tp_richcompare", cfunc)
+        return
 
     # get the pointer to the correct tp_as_* structure
     # or create it if it doesn't exist
@@ -395,6 +457,23 @@ def _curse_special(klass, attr, func):
 
 def _revert_special(klass, attr):
     tp_as_name, impl_method = override_dict[attr]
+    
+    # Special handling for rich comparison methods
+    if tp_as_name == "tp_richcompare":
+        # Remove the individual comparison method
+        if (klass, attr) in rich_compare_methods:
+            del rich_compare_methods[(klass, attr)]
+        
+        # Check if there are any remaining rich comparison methods for this class
+        has_remaining = any(k == klass for k, _ in rich_compare_methods.keys())
+        
+        if not has_remaining:
+            # No more rich comparison methods, but keep the dispatcher
+            # It will return NotImplemented for all operations, allowing Python
+            # to use default comparison behavior
+            pass
+        return
+    
     tyobj = PyTypeObject.from_address(id(klass))
     tp_as_ptr = getattr(tyobj, tp_as_name)
     if tp_as_ptr:
